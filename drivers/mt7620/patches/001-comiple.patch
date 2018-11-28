@@ -1,0 +1,889 @@
+diff --git a/build/Makefile b/build/Makefile
+index 5a12bfa..0ae006a 100644
+--- a/build/Makefile
++++ b/build/Makefile
+@@ -1,15 +1,7 @@
+-ifeq ($(CONFIG_SUPPORT_OPENWRT),y)
+ EXTRA_CFLAGS = -I$(src)/../src/include -I$(src)/../src/ate/include
+ DRV_NAME = mt7620
+ SRC_DIR = ../src
+ obj-m += $(DRV_NAME).o
+-else
+-EXTRA_CFLAGS = -Idrivers/net/wireless/rt2860v2/include -Idrivers/net/wireless/rt2860v2/ate/include
+-DRV_NAME = rt2860v2_ap
+-SRC_DIR = ../rt2860v2
+-obj-$(CONFIG_RT2860V2_AP) += $(DRV_NAME).o
+-endif
+-
+ 
+ $(DRV_NAME)-objs += $(SRC_DIR)/common/crypt_md5.o
+ $(DRV_NAME)-objs += $(SRC_DIR)/common/crypt_sha2.o
+@@ -70,6 +62,7 @@ $(DRV_NAME)-objs += $(SRC_DIR)/rate_ctrl/alg_ags.o
+ 
+ $(DRV_NAME)-objs += $(SRC_DIR)/os/linux/rt_proc.o
+ $(DRV_NAME)-objs += $(SRC_DIR)/os/linux/rt_linux.o
++$(DRV_NAME)-objs += $(SRC_DIR)/os/linux/rt_flash.o
+ $(DRV_NAME)-objs += $(SRC_DIR)/os/linux/rt_profile.o
+ $(DRV_NAME)-objs += $(SRC_DIR)/os/linux/rt_main_dev.o
+ $(DRV_NAME)-objs += $(SRC_DIR)/os/linux/ap_ioctl.o
+@@ -251,7 +244,12 @@ EXTRA_CFLAGS += -DAGGREGATION_SUPPORT -DPIGGYBACK_SUPPORT -DWMM_SUPPORT  -DLINUX
+ EXTRA_CFLAGS += -DCONFIG_AP_SUPPORT -DAP_SCAN_SUPPORT -DUAPSD_AP_SUPPORT -DUAPSD_SUPPORT -DRTMP_RBUS_SUPPORT -DRTMP_MAC_PCI
+ EXTRA_CFLAGS += -DDOT11_N_SUPPORT -DSTATS_COUNT_SUPPORT -DIAPP_SUPPORT -DDOT1X_SUPPORT
+ EXTRA_CFLAGS += -DRALINK_ATE -DRALINK_QA -DCONFIG_RT2880_ATE_CMD_NEW
++
++ifeq ($(CONFIG_RT2860V2_WIFI_HW_NAT),y)
++EXTRA_CFLAGS += -DCONFIG_WIFI_HW_NAT
++else
+ EXTRA_CFLAGS += -DCONFIG_RA_NAT_NONE
++endif
+ 
+ #provide busy time statistics for every TBTT */
+ #EXTRA_CFLAGS += -DQLOAD_FUNC_BUSY_TIME_STATS 
+diff --git a/src/ap/ap.c b/src/ap/ap.c
+index 6c26a74..fb8bf1b 100644
+--- a/src/ap/ap.c
++++ b/src/ap/ap.c
+@@ -306,6 +306,17 @@ VOID APStartUp(
+ 		else
+ 			pMbss->WpaMixPairCipher = MIX_CIPHER_NOTUSE;
+ 
++        if (pMbss->WepStatus == Ndis802_11Encryption2Enabled ||
++            pMbss->WepStatus == Ndis802_11Encryption3Enabled ||
++            pMbss->WepStatus == Ndis802_11Encryption4Enabled)
++        {
++            RT_CfgSetWPAPSKKey(pAd, pMbss->WPAKeyString,
++                               strlen(pMbss->WPAKeyString),
++                               (PUCHAR)pAd->ApCfg.MBSSID[apidx].Ssid,
++                               pAd->ApCfg.MBSSID[apidx].SsidLen,
++                               pAd->ApCfg.MBSSID[apidx].PMK);
++        }
++
+ 		/* Generate the corresponding RSNIE */
+ 		RTMPMakeRSNIE(pAd, pMbss->AuthMode, pMbss->WepStatus, apidx);
+ 
+diff --git a/src/ap/ap_cfg.c b/src/ap/ap_cfg.c
+index ec05c20..20da557 100644
+--- a/src/ap/ap_cfg.c
++++ b/src/ap/ap_cfg.c
+@@ -7157,6 +7157,9 @@ INT	Set_AP_WPAPSK_Proc(
+ 	if (retval == FALSE)
+ 		return FALSE;
+ 
++    /* Keep this key string */
++    strcpy(pAd->ApCfg.MBSSID[apidx].WPAKeyString, arg);
++
+ #ifdef WSC_AP_SUPPORT
+     NdisZeroMemory(pMBSSStruct->WscControl.WpaPsk, 64);
+     pMBSSStruct->WscControl.WpaPskLen = 0;
+diff --git a/src/common/cmm_data_pci.c b/src/common/cmm_data_pci.c
+index bb4b03a..bdec4dc 100644
+--- a/src/common/cmm_data_pci.c
++++ b/src/common/cmm_data_pci.c
+@@ -1164,6 +1164,14 @@ VOID	RTMPHandlePreTBTTInterrupt(
+ 	{
+ 		APUpdateAllBeaconFrame(pAd);
+ 
++	    POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
++#ifdef WORKQUEUE_BH
++        RTMP_OS_TASKLET_SCHE(&pObj->pretbtt_work);
++#else
++        RTMP_OS_TASKLET_SCHE(&pObj->pretbtt_task);
++#endif
++
++#if 0
+ 		RTMP_IO_WRITE32(pAd, MCU_INT_STATUS, 0x14);
+ 		pAd->MacTab.fMcastPsQEnable = FALSE;
+ 
+@@ -1222,6 +1230,7 @@ VOID	RTMPHandlePreTBTTInterrupt(
+ 				pAd->MacTab.fMcastPsQEnable = TRUE;
+ 			}
+ 		}
++#endif
+ 	}
+ 	else
+ #endif /* CONFIG_AP_SUPPORT */
+diff --git a/src/common/cmm_info.c b/src/common/cmm_info.c
+index 4f4b7a7..6bd535f 100644
+--- a/src/common/cmm_info.c
++++ b/src/common/cmm_info.c
+@@ -22,7 +22,9 @@
+     Who          When          What
+     ---------    ----------    ----------------------------------------------
+  */
+- 
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wmisleading-indentation"
++
+ #include	"rt_config.h"
+ 
+ 
+@@ -3894,112 +3896,14 @@ VOID RTMPIoctlGetMacTable(
+ 	IN RTMP_IOCTL_INPUT_STRUCT *wrq)
+ {
+ 	INT i;
+-/*	RT_802_11_MAC_TABLE MacTab;*/
+-	RT_802_11_MAC_TABLE *pMacTab = NULL;
+-	RT_802_11_MAC_ENTRY *pDst;
+ 	MAC_TABLE_ENTRY *pEntry;
+ 	char *msg;
+-#ifdef DPA_S //yiwei
+-	UCHAR	index;
+-	BOOLEAN	bFound;
+-#endif /* DPA_S */
+-
+-	/* allocate memory */
+-	os_alloc_mem(NULL, (UCHAR **)&pMacTab, sizeof(RT_802_11_MAC_TABLE));
+-	if (pMacTab == NULL)
+-	{
+-		DBGPRINT(RT_DEBUG_ERROR, ("%s: Allocate memory fail!!!\n", __FUNCTION__));
+-		return;
+-	}
+-
+-	NdisZeroMemory(pMacTab, sizeof(RT_802_11_MAC_TABLE));
+-	pMacTab->Num = 0;
+-	for (i=0; i<MAX_LEN_OF_MAC_TABLE; i++)
+-	{
+-		pEntry = &(pAd->MacTab.Content[i]);
+-
+-#ifdef DPA_S
+-		if ((IS_P2P_GO_ENTRY(pEntry) || IS_P2P_CLI_ENTRY(pEntry)) 
+-			&& (pEntry->PortSecured == WPA_802_1X_PORT_SECURED))
+-#else /* DPA_S */
+-		if (IS_ENTRY_CLIENT(pEntry) && (pEntry->Sst == SST_ASSOC))
+-#endif /* !DPA_S */
+-		{
+-			pDst = &pMacTab->Entry[pMacTab->Num];
+-
+-#ifdef DPA_S //yiwei
+-			bFound = FALSE;
+-			if (IS_P2P_GO_ENTRY(pEntry) || IS_P2P_CLI_ENTRY(pEntry))
+-			{
+-				index = P2pGroupTabSearch(pAd, pEntry->Addr);
+-				if(index != P2P_NOT_FOUND)
+-					bFound = TRUE;
+-			}
+-
+-			if(bFound)
+-			{
+-				RTMPMoveMemory(&(pDst->DeviceName[0]), &pAd->P2pTable.Client[index].DeviceName[0], pAd->P2pTable.Client[index].DeviceNameLen);
+-				pDst->DeviceNameLen = pAd->P2pTable.Client[index].DeviceNameLen;
+-				pDst->DeviceName[pDst->DeviceNameLen]=0x0;
+-			}
+-			else
+-			{
+-				pDst->DeviceNameLen = 0;
+-			}
+-#endif /* DPA_S */
+ 
+-			pDst->ApIdx = (UCHAR)pEntry->apidx;
+-			COPY_MAC_ADDR(pDst->Addr, &pEntry->Addr);
+-			pDst->Aid = (UCHAR)pEntry->Aid;
+-			pDst->Psm = pEntry->PsMode;
+-#ifdef DOT11_N_SUPPORT
+-			pDst->MimoPs = pEntry->MmpsMode;
+-#endif /* DOT11_N_SUPPORT */
+-
+-			/* Fill in RSSI per entry*/
+-			pDst->AvgRssi0 = pEntry->RssiSample.AvgRssi0;
+-			pDst->AvgRssi1 = pEntry->RssiSample.AvgRssi1;
+-			pDst->AvgRssi2 = pEntry->RssiSample.AvgRssi2;
+-
+-			/* the connected time per entry*/
+-			pDst->ConnectedTime = pEntry->StaConnectTime;
+-			pDst->TxRate.word = pEntry->HTPhyMode.word;
+-									
+-#ifdef RTMP_RBUS_SUPPORT
+-			pDst->LastRxRate = pEntry->LastRxRate;
+-#if defined(RT2883) || defined(RT3883)
+-			if (IS_RT2883(pAd) || IS_RT3883(pAd))
+-			{
+-				pDst->StreamSnr[0] = pEntry->BF_SNR[0];
+-				pDst->StreamSnr[1] = pEntry->BF_SNR[1];
+-				pDst->StreamSnr[2] = pEntry->BF_SNR[2];
+-#ifdef TXBF_SUPPORT
+-				pDst->SoundingRespSnr[0] = pEntry->sndg0Snr0;
+-				pDst->SoundingRespSnr[1] = pEntry->sndg0Snr1;
+-				pDst->SoundingRespSnr[2] = pEntry->sndg0Snr2;
+-#endif /* TXBF_SUPPORT */
+-			}
+-#endif /* defined(RT2883) || defined(RT3883) */
+-/*			pDst->TxPER = pEntry->SaveTxPER; */
+-#endif /* RTMP_RBUS_SUPPORT */
+-									
+-			pMacTab->Num += 1;
+-		}
+-	}
+-
+-	wrq->u.data.length = sizeof(RT_802_11_MAC_TABLE);
+-	if (copy_to_user(wrq->u.data.pointer, pMacTab, wrq->u.data.length))
+-	{
+-		DBGPRINT(RT_DEBUG_TRACE, ("%s: copy_to_user() fail\n", __FUNCTION__));
+-	}
+-
+-
+-/*	msg = kmalloc(sizeof(CHAR)*(MAX_LEN_OF_MAC_TABLE*MAC_LINE_LEN), MEM_ALLOC_FLAG);*/
+ 	os_alloc_mem(NULL, (UCHAR **)&msg, sizeof(CHAR)*(MAX_LEN_OF_MAC_TABLE*MAC_LINE_LEN));
+ 	if (msg == NULL)
+ 	{
+ 		DBGPRINT(RT_DEBUG_ERROR, ("%s():Alloc memory failed\n", __FUNCTION__));
+-		goto LabelOK;
++		return;
+ 	}
+ 	memset(msg, 0 ,MAX_LEN_OF_MAC_TABLE*MAC_LINE_LEN );
+ 	sprintf(msg,"%s","\n");
+@@ -4036,13 +3940,16 @@ VOID RTMPIoctlGetMacTable(
+ 	} 
+ 	/* for compatible with old API just do the printk to console*/
+ 
++	wrq->u.data.length = strlen(msg);
++	if (copy_to_user(wrq->u.data.pointer, msg, wrq->u.data.length))
++	{
++		DBGPRINT(RT_DEBUG_OFF, ("%s", msg));
++	}
++
+ 	DBGPRINT(RT_DEBUG_TRACE, ("%s", msg));
+ /*	kfree(msg);*/
+ 	os_free_mem(NULL, msg);
+ 
+-LabelOK:
+-	if (pMacTab != NULL)
+-		os_free_mem(NULL, pMacTab);
+ }
+ #define	ASSO_MAC_LINE_LEN	(1+19+4+4+4+4+8+7+7+7+10+6+6+6+6+7+7+1)
+ 
+@@ -7957,4 +7864,4 @@ INT Set_ModuleTxpower_Proc(
+ }
+ 
+ #endif /* SINGLE_SKU */
+-
++#pragma GCC diagnostic pop
+diff --git a/src/common/cmm_profile.c b/src/common/cmm_profile.c
+index 32c51dc..ef30f17 100644
+--- a/src/common/cmm_profile.c
++++ b/src/common/cmm_profile.c
+@@ -1710,6 +1710,9 @@ static int rtmp_parse_wpapsk_buffer_from_file(IN  PRTMP_ADAPTER pAd,IN  PSTRING
+ 	if (ret == FALSE)
+ 		return FALSE;
+ 
++    /* Keep this key string */
++    strcpy(pAd->ApCfg.MBSSID[i].WPAKeyString, tmpbuf);
++
+ #ifdef WSC_AP_SUPPORT
+ 	NdisZeroMemory(pAd->ApCfg.MBSSID[i].WscControl.WpaPsk, 64);
+ 	pAd->ApCfg.MBSSID[i].WscControl.WpaPskLen = 0;
+@@ -3660,14 +3663,16 @@ NDIS_STATUS	RTMPSetProfileParameters(
+ 									else if ((strncmp(macptr, "SMS4", 4) == 0) || (strncmp(macptr, "sms4", 4) == 0))
+ 					            			pAd->ApCfg.MBSSID[apidx].WepStatus = Ndis802_11EncryptionSMS4Enabled;									
+ #endif /* WAPI_SUPPORT */
+-		        		else
++		        		else {
+ 		            			pAd->ApCfg.MBSSID[apidx].WepStatus = Ndis802_11WEPDisabled;
++						}
+ 
+ 						/* decide the group key encryption type*/
+-						if (pAd->ApCfg.MBSSID[apidx].WepStatus == Ndis802_11Encryption4Enabled)	
++						if (pAd->ApCfg.MBSSID[apidx].WepStatus == Ndis802_11Encryption4Enabled)	{
+ 							pAd->ApCfg.MBSSID[apidx].GroupKeyWepStatus = Ndis802_11Encryption2Enabled;		
+-						else
++						} else {
+ 							pAd->ApCfg.MBSSID[apidx].GroupKeyWepStatus = pAd->ApCfg.MBSSID[apidx].WepStatus;
++						}
+ 
+ 						/* move to ap.c::APStartUp to process*/
+ 	        			/*RTMPMakeRSNIE(pAd, pAd->ApCfg.MBSSID[apidx].AuthMode, pAd->ApCfg.MBSSID[apidx].WepStatus, apidx);*/
+diff --git a/src/common/crypt_biginteger.c b/src/common/crypt_biginteger.c
+index b27d4ca..dafd077 100644
+--- a/src/common/crypt_biginteger.c
++++ b/src/common/crypt_biginteger.c
+@@ -167,8 +167,9 @@ VOID BigInteger_Print (
+ VOID BigInteger_Init (
+     INOUT PBIG_INTEGER *pBI)
+ {
+-    if (*pBI != NULL)
+-        BigInteger_Free(pBI);
++    if (*pBI != NULL){
++        BigInteger_Free(pBI);
++	}
+ 
+ 	os_alloc_mem(NULL, (UCHAR **)pBI, sizeof(BIG_INTEGER));
+ /*    if ((*pBI = (PBIG_INTEGER) kmalloc(sizeof(BIG_INTEGER), GFP_ATOMIC)) == NULL) { */
+diff --git a/src/common/mlme.c b/src/common/mlme.c
+index 9979e09..9d510ec 100644
+--- a/src/common/mlme.c
++++ b/src/common/mlme.c
+@@ -5522,8 +5522,9 @@ BOOLEAN MlmeEnqueueForWsc(
+ 	DBGPRINT(RT_DEBUG_TRACE, ("-----> MlmeEnqueueForWsc\n"));
+     /* Do nothing if the driver is starting halt state.*/
+     /* This might happen when timer already been fired before cancel timer with mlmehalt*/
+-    if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_HALT_IN_PROGRESS))
++    if (RTMP_TEST_FLAG(pAd, fRTMP_ADAPTER_HALT_IN_PROGRESS)) {
+         return FALSE;
++	}
+ 
+ 	/* First check the size, it MUST not exceed the mlme queue size*/
+ 	if (MsgLen > MGMT_DMA_BUFFER_SIZE)
+diff --git a/src/common/wsc.c b/src/common/wsc.c
+index 400a61f..e70ae3f 100644
+--- a/src/common/wsc.c
++++ b/src/common/wsc.c
+@@ -28,6 +28,10 @@
+ 	Snowpin Lee 07-04-19        Do modifications and Add APIs for STA
+ 	Snowpin Lee 07-05-17        Do modifications and Add APIs for AP Client
+ */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wmisleading-indentation"
++#include <linux/sched/task.h>
++#include <linux/sched/signal.h>
+ 
+ #include    "rt_config.h"
+ 
+@@ -12058,4 +12062,4 @@ BOOLEAN WscGetDataFromPeerByTag(
+ }
+ 
+ #endif /* WSC_INCLUDED */
+-
++#pragma GCC diagnostic pop
+diff --git a/src/include/chip/rt2880.h b/src/include/chip/rt2880.h
+index ff33a97..c4b38c2 100644
+--- a/src/include/chip/rt2880.h
++++ b/src/include/chip/rt2880.h
+@@ -37,7 +37,7 @@
+ 
+ #ifdef LINUX
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,21)
+-#include <asm/rt2880/rt_mmap.h>
++#include "rt_mmap.h"
+ #define RTMP_MAC_CSR_ADDR RALINK_11N_MAC_BASE
+ #else
+ 
+diff --git a/src/include/iface/rtmp_rbs.h b/src/include/iface/rtmp_rbs.h
+index b0fc752..1e300c2 100644
+--- a/src/include/iface/rtmp_rbs.h
++++ b/src/include/iface/rtmp_rbs.h
+@@ -38,7 +38,7 @@
+   *
+   ************************************************************************/  
+ 
+-#define RTMP_MAC_IRQ_NUM		4
++#define RTMP_MAC_IRQ_NUM		6
+ 
+ 
+ /*************************************************************************
+@@ -83,11 +83,7 @@
+ #endif /* CONFIG_RT2860V2_2850 */
+ 
+ #if defined (CONFIG_RALINK_RT6352)  || defined (CONFIG_RALINK_MT7620)
+-#if defined(CONFIG_SUPPORT_OPENWRT)
+ #define EEPROM_DEFAULT_FILE_PATH                     "/etc/wireless/mt7620/mt7620.eeprom.bin"
+-#else
+-#define EEPROM_DEFAULT_FILE_PATH                     "/etc_ro/wlan/MT7620_AP_2T2R-4L_V15.BIN"
+-#endif /* CONFIG_SUPPORT_OPENWRT */
+ #endif /* defined (CONFIG_RALINK_RT6352)  || defined (CONFIG_RALINK_MT7620) */
+ 
+ #ifndef EEPROM_DEFAULT_FILE_PATH
+diff --git a/src/include/os/rt_drv.h b/src/include/os/rt_drv.h
+index 993e0de..2c4cbea 100644
+--- a/src/include/os/rt_drv.h
++++ b/src/include/os/rt_drv.h
+@@ -337,6 +337,7 @@ struct os_cookie {
+ 	RTMP_NET_TASK_STRUCT	hcca_dma_done_work;
+ 	
+ 	RTMP_NET_TASK_STRUCT	tbtt_work;
++	RTMP_NET_TASK_STRUCT	pretbtt_work;
+ 
+ #else
+ 	RTMP_NET_TASK_STRUCT	rx_done_task;
+@@ -350,6 +351,7 @@ struct os_cookie {
+ 	RTMP_NET_TASK_STRUCT	ac3_dma_done_task;
+ 	RTMP_NET_TASK_STRUCT	hcca_dma_done_task;
+ 	RTMP_NET_TASK_STRUCT	tbtt_task;
++	RTMP_NET_TASK_STRUCT	pretbtt_task;
+ #endif /* WORKQUEUE_BH */
+ 
+ #ifdef RTMP_MAC_PCI
+diff --git a/src/include/os/rt_linux.h b/src/include/os/rt_linux.h
+index a824d3d..5adc732 100644
+--- a/src/include/os/rt_linux.h
++++ b/src/include/os/rt_linux.h
+@@ -139,11 +139,7 @@ typedef struct usb_ctrlrequest devctrlrequest;
+ #define RTMP_FIRMWARE_FILE_NAME		"/etc_ro/Wireless/RT2860AP/RT2860AP.bin"
+ #define PROFILE_PATH			"/etc/Wireless/RT2860i.dat"
+ #endif /* P2P_SUPPORT */
+-#if defined(CONFIG_SUPPORT_OPENWRT)
+ #define AP_PROFILE_PATH_RBUS		"/etc/wireless/mt7620/mt7620.dat"
+-#else
+-#define AP_PROFILE_PATH_RBUS		"/etc/Wireless/RT2860/RT2860.dat"
+-#endif /* CONFIG_SUPPORT_OPENWRT */
+ #define RT2880_AP_DRIVER_VERSION	"1.0.0.0"
+ #endif /* RTMP_RBUS_SUPPORT */
+ #endif /* CONFIG_AP_SUPPORT */
+@@ -171,11 +167,7 @@ extern	const struct iw_handler_def rt28xx_iw_handler_def;
+ 
+ #ifdef SINGLE_SKU_V2
+ #ifdef RTMP_RBUS_SUPPORT
+-#if defined(CONFIG_SUPPORT_OPENWRT)
+ #define SINGLE_SKU_TABLE_FILE_NAME		"/etc/wireless/mt7620/SingleSKU.dat"
+-#else
+-#define SINGLE_SKU_TABLE_FILE_NAME	"/etc_ro/Wireless/RT2860AP/SingleSKU.dat"
+-#endif
+ #endif /* RTMP_RBUS_SUPPORT */
+ #endif /* SINGLE_SKU_V2 */
+ 
+@@ -664,6 +656,7 @@ struct os_cookie {
+ 	struct work_struct   hcca_dma_done_work;
+ 	
+ 	struct work_struct   tbtt_work;
++	struct work_struct   pretbtt_work;
+ 
+ #else
+ 	RTMP_NET_TASK_STRUCT rx_done_task;
+@@ -677,6 +670,7 @@ struct os_cookie {
+ 	RTMP_NET_TASK_STRUCT ac3_dma_done_task;
+ 	RTMP_NET_TASK_STRUCT hcca_dma_done_task;
+ 	RTMP_NET_TASK_STRUCT tbtt_task;
++	RTMP_NET_TASK_STRUCT pretbtt_task;
+ #endif /* WORKQUEUE_BH */
+ 
+ #ifdef RTMP_MAC_PCI
+diff --git a/src/include/rtmp.h b/src/include/rtmp.h
+index f641087..271fac6 100644
+--- a/src/include/rtmp.h
++++ b/src/include/rtmp.h
+@@ -1467,6 +1467,7 @@ typedef struct _MULTISSID_STRUCT {
+ 	UCHAR TimBitmaps[WLAN_MAX_NUM_OF_TIM];
+ 
+ 	/* WPA */
++	UCHAR WPAKeyString[65];
+ 	UCHAR GMK[32];
+ 	UCHAR PMK[32];
+ 	UCHAR GTK[32];
+@@ -9631,8 +9632,10 @@ VOID RtmpMgmtTaskExit(
+ 
+ #ifdef WORKQUEUE_BH
+ void tbtt_workq(struct work_struct *work);
++void pretbtt_workq(struct work_struct *work);
+ #else
+ void tbtt_tasklet(unsigned long data);
++void pretbtt_tasklet(unsigned long data);
+ #endif /* WORKQUEUE_BH */
+ 
+ 
+diff --git a/src/include/video.h b/src/include/video.h
+index 54ec5e6..d882c2f 100644
+--- a/src/include/video.h
++++ b/src/include/video.h
+@@ -8,5 +8,6 @@ UCHAR GetAsicDefaultTxBA(IN PRTMP_ADAPTER pAd);
+ UINT32 GetAsicVideoRetry(IN PRTMP_ADAPTER pAd);
+ UCHAR GetAsicVideoTxBA(IN PRTMP_ADAPTER pAd);
+ VOID VideoConfigInit(IN PRTMP_ADAPTER pAd);
++VOID VideoTurbineDynamicTune(IN PRTMP_ADAPTER pAd);
+ #endif /* VIDEO_TURBINE_SUPPORT */
+ 
+diff --git a/src/os/linux/rt_flash.c b/src/os/linux/rt_flash.c
+new file mode 100644
+index 0000000..34c13e8
+--- /dev/null
++++ b/src/os/linux/rt_flash.c
+@@ -0,0 +1,132 @@
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/sched.h>
++#include <linux/backing-dev.h>
++#include <linux/compat.h>
++#include <linux/mount.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/map.h>
++#include <linux/mtd/concat.h>
++#include <linux/mtd/partitions.h>
++
++struct proc_dir_entry *procRegDir;
++/*
++ * Flash API: ra_mtd_read, ra_mtd_write
++ * Arguments:
++ *   - num: specific the mtd number
++ *   - to/from: the offset to read from or written to
++ *   - len: length
++ *   - buf: data to be read/written
++ * Returns:
++ *   - return -errno if failed
++ *   - return the number of bytes read/written if successed
++ */
++int ra_mtd_write_nm(char *name, loff_t to, size_t len, const u_char *buf)
++{
++    int ret = -1;
++    size_t rdlen, wrlen;
++    struct mtd_info *mtd;
++    struct erase_info ei;
++    u_char *bak = NULL;
++
++    mtd = get_mtd_device_nm(name);
++
++    if (IS_ERR(mtd)) {
++        ret = (int)mtd;
++        goto out;
++    }
++
++    if (len > mtd->erasesize) {
++        put_mtd_device(mtd);
++        ret = -E2BIG;
++        goto out;
++    }
++
++    bak = kzalloc(mtd->erasesize, GFP_KERNEL);
++    if (bak == NULL) {
++        put_mtd_device(mtd);
++        ret = -ENOMEM;
++        goto out;
++    }
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0)
++    ret = mtd_read(mtd, 0, mtd->erasesize, &rdlen, bak);
++#else
++    ret = mtd->read(mtd, 0, mtd->erasesize, &rdlen, bak);
++#endif
++    if (ret) {
++        goto free_out;
++    }
++
++    if (rdlen != mtd->erasesize)
++        printk("warning: ra_mtd_write_nm: rdlen is not equal to erasesize\n");
++
++    memcpy(bak + to, buf, len);
++
++    ei.mtd = mtd;
++    ei.callback = NULL;
++    ei.addr = 0;
++    ei.len = mtd->erasesize;
++    ei.priv = 0;
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0)
++    ret = mtd_erase(mtd, &ei);
++#else
++    ret = mtd->erase(mtd, &ei);
++#endif
++    if (ret != 0)
++        goto free_out;
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0)
++    ret = mtd_write(mtd, 0, mtd->erasesize, &wrlen, bak);
++#else
++    ret = mtd->write(mtd, 0, mtd->erasesize, &wrlen, bak);
++#endif
++
++    udelay(10); /* add delay after write */
++
++free_out:
++    if (mtd)
++        put_mtd_device(mtd);
++
++    if (bak)
++        kfree(bak);
++out:
++    return ret;
++}
++
++int ra_mtd_read_nm(char *name, loff_t from, size_t len, u_char *buf)
++{
++    int ret;
++    size_t rdlen = 0;
++    struct mtd_info *mtd;
++
++    mtd = get_mtd_device_nm(name);
++    if (IS_ERR(mtd))
++        return (int)mtd;
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0)
++    ret = mtd_read(mtd, from, len, &rdlen, buf);
++#else
++    ret = mtd->read(mtd, from, len, &rdlen, buf);
++#endif
++    if (rdlen != len)
++        printk("warning: ra_mtd_read_nm: rdlen is not equal to len\n");
++
++    put_mtd_device(mtd);
++    return ret;
++}
++
++EXPORT_SYMBOL(ra_mtd_write_nm);
++EXPORT_SYMBOL(ra_mtd_read_nm);
++EXPORT_SYMBOL(procRegDir);
++
++MODULE_AUTHOR("Steven Liu <steven_liu@ralinktech.com.tw>");
++MODULE_DESCRIPTION("Ralink APSoC Flash Map");
++MODULE_LICENSE("GPL");
+diff --git a/src/os/linux/rt_linux.c b/src/os/linux/rt_linux.c
+index fdaecf5..98e0428 100644
+--- a/src/os/linux/rt_linux.c
++++ b/src/os/linux/rt_linux.c
+@@ -38,13 +38,8 @@
+ #include "dot11i_wpa.h"
+ 
+ #if defined(CONFIG_RA_HW_NAT) || defined(CONFIG_RA_HW_NAT_MODULE)
+-#if defined(CONFIG_SUPPORT_OPENWRT)
+ #include "../../../linux-kernel/net/nat/hw_nat/ra_nat.h"
+ #include "../../../linux-kernel/net/nat/hw_nat/frame_engine.h"
+-#else
+-#include "../../../../../../net/nat/hw_nat/ra_nat.h"
+-#include "../../../../../../net/nat/hw_nat/frame_engine.h"
+-#endif /* CONFIG_SUPPORT_OPENWRT */
+ #endif
+ 
+ /* TODO */
+@@ -321,7 +316,7 @@ void RtmpFlashRead(
+ #ifdef RA_MTD_RW_BY_NUM
+ 	ra_mtd_read(MTD_NUM_FACTORY, 0, (size_t) b, p);
+ #else
+-	ra_mtd_read_nm("Factory", a&0xFFFF, (size_t) b, p);
++	ra_mtd_read_nm("factory", a&0xFFFF, (size_t) b, p);
+ #endif
+ #endif /* CONFIG_RALINK_FLASH_API */
+ }
+@@ -337,7 +332,7 @@ void RtmpFlashWrite(
+ #ifdef RA_MTD_RW_BY_NUM
+ 	ra_mtd_write(MTD_NUM_FACTORY, 0, (size_t) b, p);
+ #else
+-	ra_mtd_write_nm("Factory", a&0xFFFF, (size_t) b, p);
++	ra_mtd_write_nm("factory", a&0xFFFF, (size_t) b, p);
+ #endif
+ #endif /* CONFIG_RALINK_FLASH_API */
+ }
+@@ -1176,21 +1171,12 @@ void RtmpOSFileSeek(RTMP_OS_FD osfd,
+ int RtmpOSFileRead(RTMP_OS_FD osfd,
+ 		     char *pDataPtr, int readLen) {
+ 	/* The object must have a read method */
+-	if (osfd->f_op && osfd->f_op->read) {
+-		return osfd->f_op->read(osfd, pDataPtr, readLen, &osfd->f_pos);
+-	} else {
+-		DBGPRINT(RT_DEBUG_ERROR, ("no file read method\n"));
+-		return -1;
+-	}
++		return kernel_read(osfd, pDataPtr, readLen, &osfd->f_pos);
+ }
+ 
+ int RtmpOSFileWrite(RTMP_OS_FD osfd,
+ 		    char *pDataPtr, int writeLen) {
+-	return osfd->f_op->write(osfd,
+-				 pDataPtr,
+-				 (
+-	size_t) writeLen,
+-				 &osfd->f_pos);
++	return kernel_write(osfd, pDataPtr,(size_t) writeLen,&osfd->f_pos);
+ }
+ 
+ static inline void __RtmpOSFSInfoChange(OS_FS_INFO * pOSFSInfo,
+diff --git a/src/os/linux/rt_proc.c b/src/os/linux/rt_proc.c
+index aeebcd1..f57432a 100644
+--- a/src/os/linux/rt_proc.c
++++ b/src/os/linux/rt_proc.c
+@@ -29,6 +29,7 @@
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ #include <linux/proc_fs.h>
++#include <linux/uaccess.h>
+ #include <asm/uaccess.h>
+ 
+ #include "rt_config.h"
+@@ -61,7 +62,7 @@ int wl_proc_exit(void);
+ #endif /* PROCREG_DIR */
+ 
+ #ifdef CONFIG_PROC_FS
+-extern struct proc_dir_entry *procRegDir;
++struct proc_dir_entry *procRegDir2860v2;
+ 
+ #ifdef VIDEO_TURBINE_SUPPORT
+ extern BOOLEAN UpdateFromGlobal;
+@@ -381,7 +382,7 @@ int wl_video_proc_init(void)
+ 	GLOBAL_AP_VIDEO_CONFIG.TxLifeTime = 0;
+ 	GLOBAL_AP_VIDEO_CONFIG.TxRetryLimit = 0;
+ 
+-		proc_ralink_wl = proc_mkdir("wl", procRegDir);
++		proc_ralink_wl = proc_mkdir("wl", procRegDir2860v2);
+ 
+ 	if (proc_ralink_wl)
+ 		proc_ralink_wl_video = proc_mkdir("VideoTurbine", proc_ralink_wl);
+@@ -498,10 +499,10 @@ int wl_video_proc_exit(void)
+ 
+ int wl_proc_init(void)
+ {
+-	if (procRegDir == NULL)
+-		procRegDir = proc_mkdir(PROCREG_DIR, NULL);
++	if (procRegDir2860v2 == NULL)
++		procRegDir2860v2 = proc_mkdir(PROCREG_DIR, NULL);
+ 
+-	if (procRegDir) {
++	if (procRegDir2860v2) {
+ #ifdef VIDEO_TURBINE_SUPPORT
+ 		wl_video_proc_init();
+ #endif /* VIDEO_TURBINE_SUPPORT */
+@@ -518,7 +519,7 @@ int wl_proc_exit(void)
+ 		remove_proc_entry("Video", proc_ralink_wl);
+ 	}
+ 	if (proc_ralink_wl)
+-		remove_proc_entry("wl", procRegDir);
++		remove_proc_entry("wl", procRegDir2860v2);
+ #endif /* VIDEO_TURBINE_SUPPORT */
+ 
+ 	
+diff --git a/src/os/linux/rt_profile.c b/src/os/linux/rt_profile.c
+index 1e96f9d..196cd9e 100644
+--- a/src/os/linux/rt_profile.c
++++ b/src/os/linux/rt_profile.c
+@@ -27,13 +27,8 @@
+ 
+ #ifdef RTMP_RBUS_SUPPORT
+ #if defined(CONFIG_RA_HW_NAT) || defined(CONFIG_RA_HW_NAT_MODULE)
+-#if defined(CONFIG_SUPPORT_OPENWRT)
+ #include "../../../linux-kernel/net/nat/hw_nat/ra_nat.h"
+ #include "../../../linux-kernel/net/nat/hw_nat/frame_engine.h"
+-#else
+-#include "../../../../../../net/nat/hw_nat/ra_nat.h"
+-#include "../../../../../../net/nat/hw_nat/frame_engine.h"
+-#endif /* CONFIG_SUPPORT_OPENWRT */
+ #endif
+ #endif /* RTMP_RBUS_SUPPORT */
+ 
+@@ -515,6 +510,96 @@ void tbtt_tasklet(unsigned long data)
+ #endif /* CONFIG_AP_SUPPORT */
+ }
+ 
++#ifdef WORKQUEUE_BH
++void pretbtt_workq(struct work_struct *work)
++#else
++void pretbtt_tasklet(unsigned long data)
++#endif /* WORKQUEUE_BH */
++{
++/*#define MAX_TX_IN_TBTT       (16) */
++
++#ifdef CONFIG_AP_SUPPORT
++#ifdef WORKQUEUE_BH
++   POS_COOKIE pObj = container_of(work, struct os_cookie, pretbtt_work);
++   PRTMP_ADAPTER pAd = pObj->pAd_va;
++#else
++   PRTMP_ADAPTER pAd = (PRTMP_ADAPTER) data;
++#endif /* WORKQUEUE_BH */
++
++   RTMP_IO_WRITE32(pAd, MCU_INT_STATUS, 0x14);
++   pAd->MacTab.fMcastPsQEnable = FALSE;
++
++   if ((pAd->ApCfg.DtimCount == 0) &&
++       (pAd->MacTab.McastPsQueue.Head))
++   {
++       UINT32 macValue;
++       PQUEUE_ENTRY pEntry;
++       BOOLEAN bPS = FALSE;
++       UINT count = 0;
++       unsigned long IrqFlags;
++
++       RTMP_IO_READ32(pAd, PBF_CFG, &macValue);
++       macValue &= (~0x0C);
++       RTMP_IO_WRITE32(pAd, PBF_CFG, macValue);
++
++       RTMP_IRQ_LOCK(&pAd->irq_lock, IrqFlags);
++
++       while (pAd->MacTab.McastPsQueue.Head)
++       {
++           bPS = TRUE;
++#if 0
++           if (pAd->TxSwQueue[QID_AC_BE].Number <= (MAX_PACKETS_IN_QUEUE + MAX_PACKETS_IN_MCAST_PS_QUEUE))
++#else
++           if (pAd->TxSwQueue[QID_HCCA].Number <= (MAX_PACKETS_IN_QUEUE + MAX_PACKETS_IN_MCAST_PS_QUEUE))
++#endif
++           {
++               pEntry = RemoveHeadQueue(&pAd->MacTab.McastPsQueue);
++
++               if (count)
++               {
++                   RTMP_SET_PACKET_MOREDATA(pEntry, TRUE);
++               }
++#if 0
++               InsertHeadQueue(&pAd->TxSwQueue[QID_AC_BE], pEntry);
++#else
++               InsertHeadQueue(&pAd->TxSwQueue[QID_HCCA], pEntry);
++#endif
++               count++;
++           }
++           else
++           {
++               break;
++           }
++       }
++
++       RTMP_IRQ_UNLOCK(&pAd->irq_lock, IrqFlags);
++
++       if (pAd->MacTab.McastPsQueue.Number == 0)
++       {
++           UINT bss_index;
++
++           /* clear MCAST/BCAST backlog bit for all BSS */
++           for(bss_index=BSS0; bss_index<pAd->ApCfg.BssidNum; bss_index++)
++               WLAN_MR_TIM_BCMC_CLEAR(bss_index);
++           /* End of for */
++       }
++       pAd->MacTab.PsQIdleCount = 0;
++
++       // Dequeue outgoing framea from TxSwQueue0..3 queue and process it
++       if (bPS == TRUE)
++       {
++           UINT32 macValue1, idx;
++#if 0
++           RTMPDeQueuePacket(pAd, FALSE, NUM_OF_TX_RING, /*MAX_TX_IN_TBTT*/MAX_PACKETS_IN_MCAST_PS_QUEUE);
++#else
++           RTMPDeQueuePacket(pAd, FALSE, QID_HCCA, /*MAX_TX_IN_TBTT*/MAX_PACKETS_IN_MCAST_PS_QUEUE);
++#endif
++           pAd->MacTab.fMcastPsQEnable = TRUE;
++       }
++   }
++#endif /* CONFIG_AP_SUPPORT */
++}
++
+ 
+ void announce_802_3_packet(
+ 	IN	VOID			*pAdSrc,
+diff --git a/src/os/linux/rt_rbus_pci_drv.c b/src/os/linux/rt_rbus_pci_drv.c
+index efa8a50..b73aeba 100644
+--- a/src/os/linux/rt_rbus_pci_drv.c
++++ b/src/os/linux/rt_rbus_pci_drv.c
+@@ -93,6 +93,7 @@ NDIS_STATUS RtmpNetTaskInit(IN RTMP_ADAPTER *pAd)
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->ac3_dma_done_work, ac3_dma_done_workq);
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->hcca_dma_done_work, hcca_dma_done_workq);
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->tbtt_work, tbtt_workq);
++	RTMP_OS_TASKLET_INIT(pAd, &pObj->pretbtt_work, pretbtt_workq);
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->fifo_statistic_full_work, fifo_statistic_full_workq);
+ #ifdef UAPSD_SUPPORT
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->uapsd_eosp_sent_work, uapsd_eosp_sent_workq);
+@@ -121,6 +122,7 @@ NDIS_STATUS RtmpNetTaskInit(IN RTMP_ADAPTER *pAd)
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->ac3_dma_done_task, ac3_dma_done_tasklet, (unsigned long)pAd);
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->hcca_dma_done_task, hcca_dma_done_tasklet, (unsigned long)pAd);
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->tbtt_task, tbtt_tasklet, (unsigned long)pAd);
++	RTMP_OS_TASKLET_INIT(pAd, &pObj->pretbtt_task, pretbtt_tasklet, (unsigned long)pAd);
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->fifo_statistic_full_task, fifo_statistic_full_tasklet, (unsigned long)pAd);
+ #ifdef UAPSD_SUPPORT	
+ 	RTMP_OS_TASKLET_INIT(pAd, &pObj->uapsd_eosp_sent_task, uapsd_eosp_sent_tasklet, (unsigned long)pAd);
+@@ -160,6 +162,7 @@ void RtmpNetTaskExit(IN RTMP_ADAPTER *pAd)
+ 	RTMP_OS_TASKLET_KILL(&pObj->ac3_dma_done_task);
+ 	RTMP_OS_TASKLET_KILL(&pObj->hcca_dma_done_task);
+ 	RTMP_OS_TASKLET_KILL(&pObj->tbtt_task);
++	RTMP_OS_TASKLET_KILL(&pObj->pretbtt_task);
+ 	RTMP_OS_TASKLET_KILL(&pObj->fifo_statistic_full_task);
+ #ifdef UAPSD_SUPPORT
+ 		RTMP_OS_TASKLET_KILL(&pObj->uapsd_eosp_sent_task);
+@@ -773,6 +776,13 @@ static void ac0_dma_done_tasklet(unsigned long data)
+ }
+ 
+ 
++#ifdef RALINK_ATE
++static void ate_ac0_dma_done_tasklet(unsigned long data)
++{
++	return;
++}
++#endif /* RALINK_ATE */
++
+ 
+ #ifdef UAPSD_SUPPORT
+ /*
